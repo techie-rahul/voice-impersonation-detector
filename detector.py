@@ -133,6 +133,35 @@ class AASISTDetector:
         return [self.score(p) for p in audio_paths]
 
 
+# --- Module-level convenience API -------------------------------------------------
+
+_DEFAULT_DETECTOR: "AASISTDetector | None" = None
+
+
+def detect_synthetic(audio_path: Path | str) -> dict:
+    """Classify one audio file as synthetic/spoof vs. genuine/bonafide.
+
+    Lightweight wrapper around :class:`AASISTDetector`. The first call builds a
+    single shared detector (AASIST weight loading is expensive); every later call
+    reuses that same instance. For an explicit device or batch scoring, use
+    :class:`AASISTDetector` directly.
+
+    Returns the same dict as :meth:`AASISTDetector.score`::
+
+        {
+            "file":       str,
+            "prediction": "spoof" | "bonafide",   # argmax of the two logits
+            "cm_score":   float,   # bonafide-class logit, unbounded; higher = more genuine
+            "p_bonafide": float,   # softmax probability in [0, 1]
+            "p_spoof":    float,   # softmax probability in [0, 1]
+        }
+    """
+    global _DEFAULT_DETECTOR
+    if _DEFAULT_DETECTOR is None:
+        _DEFAULT_DETECTOR = AASISTDetector()
+    return _DEFAULT_DETECTOR.score(audio_path)
+
+
 def _format_row(res: dict) -> str:
     return (
         f"  {res['prediction']:>8}  "
