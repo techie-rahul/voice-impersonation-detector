@@ -6,5 +6,6 @@ fastapi==0.141.1
 uvicorn[standard]==0.52.4
 pydantic==2.13.5
 python-multipart==0.0.32          # Phase 3: multipart/form-data file uploads
+websockets==17.1                  # Phase 4: WS server transport + manual test client
 pytest==9.1.1
 httpx==0.28.1

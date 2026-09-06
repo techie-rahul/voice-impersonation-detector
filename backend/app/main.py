@@ -10,6 +10,9 @@ Phase 3 -- speaker enrollment + persistent profiles (SQLite):
     POST   /verify-speaker            multipart: speaker_id, audio
     DELETE /speakers/{speaker_id}
 
+Phase 4 -- near-real-time analysis over WebSocket (see app.realtime):
+    WS     /ws/analyze-call/{speaker_id}
+
 No ML inference happens for ``/analyze-call``. ``/enroll`` and
 ``/verify-speaker`` reuse the existing Phase 1 Resemblyzer functions via
 ``app.speaker_service``; uploaded audio is processed in a temp file that is
@@ -27,10 +30,10 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse
 
-from app import database, speaker_service
+from app import database, realtime, speaker_service
 from app.risk_engine import calculate_risk
 from app.schemas import (
     AnalyzeCallRequest,
@@ -228,3 +231,13 @@ def delete_speaker(speaker_id: str) -> DeleteSpeakerResponse:
     return DeleteSpeakerResponse(
         success=True, speaker_id=sid, message="Speaker deleted successfully"
     )
+
+
+# --------------------------------------------------------------------------
+# Phase 4 endpoint -- near-real-time analysis over WebSocket
+# --------------------------------------------------------------------------
+
+@app.websocket("/ws/analyze-call/{speaker_id}")
+async def ws_analyze_call(websocket: WebSocket, speaker_id: str) -> None:
+    """Stream audio; receive per-window risk analysis. Logic lives in app.realtime."""
+    await realtime.handle_analyze_call_ws(websocket, speaker_id)
