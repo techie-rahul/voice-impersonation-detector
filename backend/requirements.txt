@@ -1,0 +1,8 @@
+# Phase 2 (Risk Engine + FastAPI + tests) dependencies only.
+# ML / speaker-verification deps live in ml/aasist/requirements.txt and
+# verification/requirements.txt and are intentionally not duplicated here.
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.5
+pytest==9.1.1
+httpx==0.28.1
