@@ -1,8 +1,10 @@
-# Phase 2 (Risk Engine + FastAPI + tests) dependencies only.
-# ML / speaker-verification deps live in ml/aasist/requirements.txt and
-# verification/requirements.txt and are intentionally not duplicated here.
+# Backend (FastAPI) dependencies for Phase 2 (risk engine) + Phase 3
+# (speaker enrollment). The heavier ML / speaker-verification deps live in
+# ml/aasist/requirements.txt and verification/requirements.txt and are
+# intentionally not duplicated here.
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
 pydantic==2.13.5
+python-multipart==0.0.32          # Phase 3: multipart/form-data file uploads
 pytest==9.1.1
 httpx==0.28.1

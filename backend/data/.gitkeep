@@ -1,0 +1,1 @@
+# Keeps backend/data/ in version control; the SQLite speakers.db here is gitignored.
