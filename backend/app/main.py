@@ -237,7 +237,13 @@ def delete_speaker(speaker_id: str) -> DeleteSpeakerResponse:
 # Phase 4 endpoint -- near-real-time analysis over WebSocket
 # --------------------------------------------------------------------------
 
+@app.websocket("/ws/analyze-call")
+async def ws_analyze_call_quick(websocket: WebSocket) -> None:
+    """Quick Scan: synthetic-voice detection with no identity verification."""
+    await realtime.handle_analyze_call_ws(websocket, None)
+
+
 @app.websocket("/ws/analyze-call/{speaker_id}")
 async def ws_analyze_call(websocket: WebSocket, speaker_id: str) -> None:
-    """Stream audio; receive per-window risk analysis. Logic lives in app.realtime."""
+    """Identity Protection: AASIST + speaker verification against an enrolled id."""
     await realtime.handle_analyze_call_ws(websocket, speaker_id)

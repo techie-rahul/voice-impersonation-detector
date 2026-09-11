@@ -30,6 +30,7 @@ import contextlib
 import json
 import math
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -67,6 +68,37 @@ _INFERENCE_LOCK = threading.Lock()
 
 HIGH_RISK_ALERT_THRESHOLD: float = 70.0  # matches risk_engine HIGH cut-off
 
+# Opt-in debug capture: when set, every raw mic-window WAV that analyze_window
+# writes is also copied here before its temp copy is deleted. Off by default;
+# no effect on detection, scoring, or any threshold. Used to collect real
+# browser-mic calibration samples (see analyze_window).
+_DEBUG_CAPTURE_DIR: str | None = os.environ.get("RT_DEBUG_CAPTURE_DIR")
+
+# --- Live-microphone calibration (documented MVP, not a production-grade fix) ---
+# Live mic input differs from ASVspoof's studio-recorded training distribution
+# (variable levels, room noise, leading/trailing silence). Mic-mode calibration:
+#   * silence-trim + loudness-normalise (calibrate_mic_pcm) -- applied to the
+#     SPEAKER-VERIFICATION copy only; measured to raise AASIST false positives if
+#     fed to AASIST, so AASIST always sees the raw window.
+#   * MIC_MODE_THRESHOLD_OFFSET -- a fixed decision-only reduction applied to the
+#     synthetic score handed to the risk engine (shifts ALLOW/VERIFY/BLOCK). The
+#     raw AASIST p_spoof reported to the client is never modified.
+# Empirically tuned, no calibration dataset.
+MIC_TRIM_TOP_DB: float = 25.0
+MIC_TARGET_RMS: float = 0.05
+MIC_MODE_THRESHOLD_OFFSET: float = 0.15
+# The offset targets borderline false positives, not confident detections: a
+# p_spoof at/above this is a strong "synthetic" call and is NOT discounted, so a
+# real clone still blocks in mic mode.
+MIC_OFFSET_PSPOOF_CEILING: float = 0.90
+
+# Quick Scan has no enrolled identity to verify against. Speaker verification is
+# skipped entirely; the risk engine still needs a speaker_match in [0, 1], so it
+# is given a fixed identity-uncertainty prior (an unverified caller carries some
+# baseline suspicion). The AASIST detector and the risk formula are unchanged;
+# the analysis message reports speaker_match as null in this mode.
+QUICK_SCAN_SPEAKER_MATCH: float = 0.2
+
 
 class MalformedAudioError(Exception):
     """Raised when a PCM window is not 16-bit aligned / cannot be written."""
@@ -91,11 +123,16 @@ def _clamp01(value: float) -> float:
 
 @dataclass
 class SessionState:
-    """Everything one WebSocket connection needs. Never shared between clients."""
+    """Everything one WebSocket connection needs. Never shared between clients.
 
-    speaker_id: str
+    ``speaker_id`` is ``None`` for Quick Scan (synthetic-voice detection only,
+    no identity verification).
+    """
+
+    speaker_id: str | None
     context: dict
     transaction_amount: float
+    mic_mode: bool = False  # live microphone input -> apply mic calibration
     started_at: float = field(default_factory=time.monotonic)
     analysis_count: int = 0
     buffer: bytearray = field(default_factory=bytearray)
@@ -145,6 +182,37 @@ def run_speaker_verification(speaker_id: str, wav_path: str) -> float:
     return float(result["speaker_match"])
 
 
+def calibrate_mic_pcm(pcm: bytes) -> bytes:
+    """Documented MVP calibration for live-mic conditions (not production-grade).
+
+    Trims leading/trailing silence (``librosa.effects.trim``, ``top_db=25``) and
+    RMS-normalises loudness to ``target_rms=0.05`` so a microphone window sits
+    closer to AASIST's ASVspoof studio-recorded training distribution. Returns
+    16-bit little-endian PCM bytes. Falls back to the input on empty/near-silent
+    audio.
+    """
+    import librosa
+    import numpy as np
+
+    y = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+    if y.size == 0:
+        return pcm
+
+    trimmed, _ = librosa.effects.trim(y, top_db=MIC_TRIM_TOP_DB)
+    if trimmed.size >= SAMPLE_RATE // 10:  # keep >= 0.1 s; else it was silence
+        y = trimmed
+
+    rms = float(np.sqrt(np.mean(np.square(y)))) if y.size else 0.0
+    if rms > 1e-6:
+        # Clamp the gain: a window that is still mostly silence would otherwise
+        # be over-amplified and *raise* false-positive synthetic detections.
+        gain = float(np.clip(MIC_TARGET_RMS / rms, 0.25, 4.0))
+        y = y * gain
+
+    y = np.clip(y, -1.0, 1.0)
+    return (y * 32767.0).astype("<i2").tobytes()
+
+
 def _write_temp_wav(pcm: bytes) -> str:
     if len(pcm) % SAMPLE_WIDTH != 0:
         raise MalformedAudioError("PCM window is not 16-bit aligned")
@@ -169,30 +237,74 @@ def analyze_window(pcm: bytes, session: SessionState) -> dict:
     Runs in a worker thread. All heavy calls are serialised by ``_INFERENCE_LOCK``.
     The temp WAV is deleted in ``finally``.
     """
-    wav_path = _write_temp_wav(pcm)
+    quick_scan = session.speaker_id is None
+    raw_wav = _write_temp_wav(pcm)
+    if _DEBUG_CAPTURE_DIR:
+        with contextlib.suppress(OSError):
+            os.makedirs(_DEBUG_CAPTURE_DIR, exist_ok=True)
+            dest = os.path.join(
+                _DEBUG_CAPTURE_DIR, f"mic_{time.time_ns()}.wav"
+            )
+            shutil.copyfile(raw_wav, dest)
+    # Mic calibration (trim silence + loudness-normalise) is applied to the
+    # SPEAKER-VERIFICATION copy only. Measured on the pretrained ASVspoof model,
+    # feeding trimmed/normalised audio to AASIST *raises* false positives badly
+    # (AASIST tiles a short trimmed window to 4 s and the repeat seam reads as
+    # synthetic), so AASIST always sees the raw window; mic calibration for the
+    # synthetic score is the decision-only offset below. Documented MVP, not a
+    # production-grade fix.
+    calibrated_wav = (
+        _write_temp_wav(calibrate_mic_pcm(pcm))
+        if (session.mic_mode and not quick_scan)
+        else None
+    )
     try:
         with _INFERENCE_LOCK:
-            p_spoof = _clamp01(run_aasist(wav_path))
-            speaker_match = run_speaker_verification(session.speaker_id, wav_path)
+            # Raw AASIST output -- reported to the client unchanged.
+            p_spoof = _clamp01(run_aasist(raw_wav))
+            if quick_scan:
+                speaker_match: float | None = None
+                engine_match = QUICK_SCAN_SPEAKER_MATCH
+            else:
+                speaker_match = run_speaker_verification(
+                    session.speaker_id, calibrated_wav or raw_wav
+                )
+                engine_match = _clamp01(speaker_match)  # engine needs [0, 1]
+
+            # Decision-only calibration: for live mic, feed a lowered synthetic
+            # score to the risk engine (shifts ALLOW/VERIFY/BLOCK), while the
+            # reported p_spoof stays raw. Only borderline scores are discounted
+            # (a confident detection is left alone so real clones still block).
+            # MVP adjustment for mic vs studio audio.
+            engine_synthetic = p_spoof
+            if session.mic_mode and p_spoof < MIC_OFFSET_PSPOOF_CEILING:
+                engine_synthetic = _clamp01(p_spoof - MIC_MODE_THRESHOLD_OFFSET)
             assessment = calculate_risk(
-                synthetic_score=p_spoof,
-                # response reports the raw score; the engine needs [0, 1].
-                speaker_match=_clamp01(speaker_match),
+                synthetic_score=engine_synthetic,
+                speaker_match=engine_match,
                 context=session.context,
                 transaction_amount=session.transaction_amount,
             )
     finally:
-        with contextlib.suppress(OSError):
-            os.unlink(wav_path)
+        for p in (raw_wav, calibrated_wav):
+            if p:
+                with contextlib.suppress(OSError):
+                    os.unlink(p)
+
+    factors = assessment.risk_factors
+    if quick_scan:
+        # No identity was verified, so don't surface an identity-mismatch factor
+        # (it stems only from the fixed prior). The score itself is unchanged.
+        factors = [f for f in factors if f != "Speaker identity mismatch"]
 
     analysis = {
         "type": "analysis",
         "synthetic_score": p_spoof,
-        "speaker_match": float(speaker_match),
+        "speaker_match": None if speaker_match is None else float(speaker_match),
         "risk_score": assessment.risk_score,
         "risk_level": assessment.risk_level,
         "decision": assessment.decision,
-        "risk_factors": assessment.risk_factors,
+        "risk_factors": factors,
     }
     alert = None
     if assessment.risk_score > HIGH_RISK_ALERT_THRESHOLD:
@@ -214,8 +326,13 @@ async def _send_error(websocket: WebSocket, code: str, message: str) -> None:
         await websocket.send_json({"type": "error", "code": code, "message": message})
 
 
-def _parse_start_message(payload: object) -> tuple[dict, float]:
-    """Validate the opening ``start`` message -> (context dict, transaction_amount)."""
+def _parse_start_message(payload: object) -> tuple[dict, float, bool]:
+    """Validate the opening ``start`` message.
+
+    Returns ``(context dict, transaction_amount, mic_mode)``. ``mic_mode`` is an
+    optional client hint that this session's audio is a live microphone (vs a
+    demo-file upload); it enables the mic calibration in :func:`analyze_window`.
+    """
     if not isinstance(payload, dict) or payload.get("type") != "start":
         raise WSError("INVALID_START", "First message must be JSON with type 'start'")
 
@@ -241,7 +358,8 @@ def _parse_start_message(payload: object) -> tuple[dict, float]:
             "INVALID_TRANSACTION_AMOUNT", "transaction_amount must be a number >= 0"
         )
 
-    return context, amount
+    mic_mode = bool(payload.get("mic_mode", False))
+    return context, amount, mic_mode
 
 
 async def _drain_windows(websocket: WebSocket, session: SessionState) -> bool:
@@ -274,18 +392,28 @@ async def _drain_windows(websocket: WebSocket, session: SessionState) -> bool:
     return False
 
 
-async def handle_analyze_call_ws(websocket: WebSocket, speaker_id: str) -> None:
-    """Entry point wired to ``@app.websocket('/ws/analyze-call/{speaker_id}')``."""
+async def handle_analyze_call_ws(
+    websocket: WebSocket, speaker_id: str | None
+) -> None:
+    """Entry point for both WebSocket routes.
+
+    ``speaker_id`` is a string for Identity Protection
+    (``/ws/analyze-call/{speaker_id}``) and ``None`` for Quick Scan
+    (``/ws/analyze-call``), which skips speaker verification.
+    """
     await websocket.accept()
     try:
-        # 1. speaker must be enrolled (Phase 3 store).
-        try:
-            await asyncio.to_thread(speaker_service.get_speaker, speaker_id)
-        except speaker_service.SpeakerNotFoundError:
-            await _send_error(
-                websocket, "SPEAKER_NOT_FOUND", f"Speaker '{speaker_id}' is not enrolled"
-            )
-            return
+        # 1. Identity Protection only: the speaker must be enrolled (Phase 3).
+        if speaker_id is not None:
+            try:
+                await asyncio.to_thread(speaker_service.get_speaker, speaker_id)
+            except speaker_service.SpeakerNotFoundError:
+                await _send_error(
+                    websocket,
+                    "SPEAKER_NOT_FOUND",
+                    f"Speaker '{speaker_id}' is not enrolled",
+                )
+                return
 
         # 2. first frame must be a valid JSON 'start'.
         try:
@@ -305,18 +433,23 @@ async def handle_analyze_call_ws(websocket: WebSocket, speaker_id: str) -> None:
             await _send_error(websocket, "INVALID_START", "start message is not valid JSON")
             return
         try:
-            context, amount = _parse_start_message(payload)
+            context, amount, mic_mode = _parse_start_message(payload)
         except WSError as exc:
             await _send_error(websocket, exc.code, exc.message)
             return
 
         session = SessionState(
-            speaker_id=speaker_id, context=context, transaction_amount=amount
+            speaker_id=speaker_id,
+            context=context,
+            transaction_amount=amount,
+            mic_mode=mic_mode,
         )
         await websocket.send_json(
             {
                 "type": "started",
+                "mode": "identity" if speaker_id is not None else "quick-scan",
                 "speaker_id": speaker_id,
+                "mic_calibrated": mic_mode,
                 "window_seconds": WINDOW_SECONDS,
                 "sample_rate": SAMPLE_RATE,
             }
